@@ -1,144 +1,93 @@
-# Payphone MCP Server
+# 🇪🇨 MCP Payphone
 
-Servidor [MCP (Model Context Protocol)](https://modelcontextprotocol.io/) de producción implementado en Python con el SDK `mcp` (FastMCP).  
-Expone 4 herramientas para que un agente de IA interactúe con la pasarela de pagos **Payphone** (Ecuador).
+Servidor Model Context Protocol (MCP) para la integración con **Payphone Ecuador**.
 
----
+Parte del ecosistema oficial de [MCP Hub Ecuador](https://github.com/mcphub-ec/hub).
 
-## Herramientas Expuestas
+> [!IMPORTANT]
+> **🤖 Nota para Agentes IA:** Antes de interactuar con este servidor, por favor revisa el [Agent Cheatsheet](https://github.com/mcphub-ec/hub/blob/main/agent-cheatsheet.md) en nuestro Hub principal para comprender las reglas de negocio, cálculo de IVA (15%) y formatos de identificación de Ecuador.
 
-| # | Tool                      | Endpoint                    | Descripción |
-|---|---------------------------|-----------------------------|-------------|
-| 1 | `create_payphone_sale`    | `POST /Sale`                | Crear cobro directo — envía notificación push al smartphone del usuario. |
-| 2 | `get_transaction_status`  | `GET /Sale/{transactionId}` | Consultar estado de una transacción (Approved / Pending / Rejected / Canceled). |
-| 3 | `create_payment_link`     | `POST /Links`               | Generar link de pago web (no requiere app Payphone). |
-| 4 | `reverse_transaction`     | `POST /Reverse`             | Reversar una transacción aprobada (monto total). |
+## 🚀 Características
 
-> **Regla de negocio**: Todos los montos (`amount`, `amountWithTax`, `amountWithoutTax`, `tax`) se envían como **enteros en centavos**.  
-> Ejemplo: `$1.15` → `amount=115`.
+-   Generación de links de pago web.
+-   Notificaciones push al celular del usuario (Payphone Sale).
+-   Reversos de transacciones automáticos.
+-   **Arquitectura Enterprise:** Imágenes Docker ultra-ligeras con _Healthchecks_ nativos, logs estructurados en JSON y validación continua de seguridad.
 
----
+## 🛠️ Herramientas Disponibles
 
-## Arquitectura
+-   `create_payment_link`: Genera una URL web para que el usuario pague.
+-   `create_payphone_sale`: Envía una notificación Push directamente al celular del cliente.
+-   `get_transaction_status`: Verifica si el pago fue exitoso o rechazado.
+-   `reverse_transaction`: Cancela un pago y devuelve los fondos.
 
-```
-┌──────────────┐   Streamable HTTP   ┌─────────────────┐   HTTPS/JSON   ┌────────────────────┐
-│  OpenWebUI   │ ──── POST /mcp ──── │ Payphone MCP    │ ──────────────│ pay.payphone...    │
-│  u otro LLM  │                     │ Server (:8001)  │               │ /api               │
-└──────────────┘                     └─────────────────┘               └────────────────────┘
-```
+## 📦 Instalación y Configuración
 
-- **Transporte**: Streamable HTTP → `POST/GET/DELETE http://<host>:8001/mcp`
-- **Autenticación**: Bearer token vía variable de entorno `PAYPHONE_TOKEN`
-- **Referencia OpenAPI**: [`docs/openapiv3.yaml`](docs/openapiv3.yaml)
+### 1\. Variables de Entorno
 
----
-
-## Despliegue en Linux (Debian / LXC)
-
-### 1. Dependencias del sistema
-
-```bash
-sudo apt update && sudo apt upgrade -y
-sudo apt install python3 python3-pip python3-venv -y
-```
-
-### 2. Crear entorno virtual
-
-```bash
-cd /root/mcp/payphone
-python3 -m venv venv
-source venv/bin/activate
-```
-
-### 3. Instalar dependencias Python
-
-```bash
-pip install "mcp[cli]" httpx python-dotenv uvicorn
-```
-
-### 4. Configurar variables de entorno
-
-Crea un archivo `.env` en la raíz del proyecto:
+Este servidor es completamente _stateless_. Copia el archivo `.env.example` a `.env` y configura tus datos. **Nunca hagas commit de este archivo.**
 
 ```env
-PAYPHONE_TOKEN=tu_token_de_acceso_aqui
-# Opcional: Requerido si el token maneja múltiples sucursales
-# PAYPHONE_STORE_ID=8dbfxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+PAYPHONE_TOKEN="tu_token_bearer_aqui"
 ```
 
-> ⚠ **Si `PAYPHONE_TOKEN` no está definido, el servidor NO arrancará.**
+### 2\. Despliegue con Docker (Recomendado)
 
-### 5. Ejecutar (modo desarrollo)
+Para entornos de producción o pruebas limpias, recomendamos usar nuestra imagen oficial alojada en GitHub Container Registry (`ghcr.io`).
+
+**Vía Docker CLI:**
 
 ```bash
-python server.py
+docker run -d \
+  --name mcp-payphone \
+  --env-file .env \
+  ghcr.io/mcphub-ec/mcp-payphone:latest
 ```
 
-Verás en los logs:
-```
-Iniciando Payphone MCP Server en http://0.0.0.0:8001/mcp (Streamable HTTP)
-```
+**Vía Docker Compose:**
 
-### 6. Servicio systemd (producción)
-
-```bash
-sudo nano /etc/systemd/system/payphone-mcp.service
-```
-
-```ini
-[Unit]
-Description=Payphone MCP Server
-After=network.target
-
-[Service]
-User=root
-WorkingDirectory=/root/mcp/payphone
-Environment="PATH=/root/mcp/payphone/venv/bin:$PATH"
-ExecStart=/root/mcp/payphone/venv/bin/python server.py
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
+```yaml
+services:
+  mcp-payphone:
+    image: ghcr.io/mcphub-ec/mcp-payphone:latest
+    container_name: mcp-payphone
+    env_file:
+      - .env
+    restart: unless-stopped
 ```
 
-```bash
-sudo systemctl daemon-reload
-sudo systemctl enable --now payphone-mcp.service
-sudo systemctl status payphone-mcp.service
+### 3\. Uso con Claude Desktop (Local)
+
+Si deseas conectarlo directamente a tu cliente de Claude para desarrollo local, añade la siguiente configuración a tu archivo `claude_desktop_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "mcp-payphone": {
+      "command": "docker",
+      "args": [
+        "run",
+        "-i",
+        "--rm",
+        "--env-file",
+        "/ruta/absoluta/a/tu/.env",
+        "ghcr.io/mcphub-ec/mcp-payphone:latest"
+      ]
+    }
+  }
+}
 ```
 
----
+_(Nota: También puedes correrlo directamente con `python -m server` si clonas el repositorio y manejas tu propio entorno virtual)._
 
-## Configurar el Cliente (OpenWebUI)
+## 🔒 Seguridad y Gobernanza
 
-| Campo           | Valor |
-|-----------------|-------|
-| **Tipo**        | Streamable HTTP |
-| **URL**         | `http://<IP>:8001/mcp` |
+Este proyecto sigue estándares estrictos de seguridad:
 
-Asegúrate de que el puerto `8001` no esté bloqueado por el firewall.
+-   **Stateless:** No almacena credenciales ni certificados en bases de datos.
+-   **Escaneo de Vulnerabilidades:** Cada Pull Request es analizado automáticamente con `bandit` y `detect-secrets`.
+-   **Responsible Disclosure:** Si encuentras una vulnerabilidad, por favor no abras un Issue público. Revisa nuestro [SECURITY.md](https://github.com/mcphub-ec/hub/blob/main/SECURITY.md) y contáctanos directamente a `security@mcphub.ec`.
 
----
+## 🤝 Contribuir
 
-## Estructura del Proyecto
-
-```
-payphone/
-├── server.py            # Servidor MCP principal
-├── .env                 # Variables de entorno (no versionado)
-├── .env.example         # Plantilla de ejemplo
-├── .gitignore
-├── LICENSE
-├── README.md
-└── docs/
-    └── openapiv3.yaml   # Especificación OpenAPI 3.0
-```
-
----
-
-## Licencia
-
-MIT
-# payphone
+Si deseas proponer mejoras, por favor revisa nuestra [Guía de Contribución](https://github.com/mcphub-ec/hub/blob/main/CONTRIBUTING.md) en el repositorio central. ¡Todos los Pull Requests que pasen los checks de CI/CD son bienvenidos!

@@ -1,0 +1,304 @@
+openapi: 3.0.0
+info:
+  title: Payphone API (Ecuador)
+  description: Especificación completa y robusta para integración de cobros de Payphone (Sale, Links y Reversos) diseñada para herramientas MCP. Incluye todos los campos opcionales para facturación, multitienda y detalle de tarjetas. Todos los montos deben enviarse en formato de centavos (enteros).
+  version: 1.1.0
+servers:
+  - url: https://pay.payphonetodoesposible.com/api
+    description: Servidor de Producción
+security:
+  - bearerAuth: []
+paths:
+  /Sale:
+    post:
+      summary: Crear cobro directo (API Sale)
+      description: Envía una notificación de cobro al smartphone de un usuario con la app Payphone instalada.
+      operationId: createPayphoneSale
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SaleRequest'
+      responses:
+        '200':
+          description: Cobro creado exitosamente. Devuelve el ID de la transacción.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SaleResponse'
+  /Sale/{transactionId}:
+    get:
+      summary: Consultar estado de la transacción
+      description: Verifica si una transacción fue pagada, rechazada o sigue pendiente, devolviendo información detallada del pago y la tarjeta.
+      operationId: getTransactionStatus
+      parameters:
+        - name: transactionId
+          in: path
+          required: true
+          description: ID de la transacción de Payphone a consultar.
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Estado actual y detallado de la transacción.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TransactionStatusResponse'
+  /Links:
+    post:
+      summary: Generar Link de Pago
+      description: Genera una URL de cobro web para compartir con el cliente (no requiere que tengan la app).
+      operationId: createPaymentLink
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LinkRequest'
+      responses:
+        '200':
+          description: Link generado exitosamente.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LinkResponse'
+  /Reverse:
+    post:
+      summary: Reverso de Transacción
+      description: Cancela o devuelve los fondos de una transacción previamente aprobada. (Debe ser por el monto total).
+      operationId: reverseTransaction
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReverseRequest'
+      responses:
+        '200':
+          description: Transacción reversada.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReverseResponse'
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+  schemas:
+    SaleRequest:
+      type: object
+      required:
+        - phoneNumber
+        - countryCode
+        - reference
+        - amount
+        - amountWithTax
+        - amountWithoutTax
+        - tax
+        - clientTransactionId
+      properties:
+        phoneNumber:
+          type: string
+          description: Número de teléfono sin código de país.
+          example: "0999999999"
+        countryCode:
+          type: string
+          description: Código de país.
+          example: "593"
+        clientUserId:
+          type: string
+          description: Identificador opcional del usuario en tu sistema.
+        documentId:
+          type: string
+          description: Cédula, RUC o Pasaporte del cliente para facturación.
+          example: "1712345678"
+        email:
+          type: string
+          format: email
+          description: Correo electrónico del cliente.
+          example: "cliente@ejemplo.com"
+        reference:
+          type: string
+          description: Descripción del cobro que verá el cliente.
+          example: "Pago de orden #123"
+        responseUrl:
+          type: string
+          format: uri
+          description: URL del webhook que recibirá notificaciones cuando el estado cambie.
+        amount:
+          type: integer
+          description: Monto total en centavos.
+          example: 115
+        amountWithTax:
+          type: integer
+          description: Monto base con impuestos en centavos.
+          example: 100
+        amountWithoutTax:
+          type: integer
+          description: Monto base sin impuestos en centavos.
+          example: 0
+        tax:
+          type: integer
+          description: Monto del impuesto en centavos.
+          example: 15
+        clientTransactionId:
+          type: string
+          description: ID único de la transacción en tu sistema (para conciliación).
+          example: "SYS-12345"
+        storeId:
+          type: string
+          format: uuid
+          description: ID de la sucursal/tienda (Requerido si el token de autenticación maneja múltiples tiendas).
+          example: "8dbfxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+        terminalId:
+          type: string
+          description: ID de la terminal o caja dentro de una sucursal (Opcional, útil para control interno).
+          example: "CAJA_01"
+          
+    SaleResponse:
+      type: object
+      properties:
+        transactionId:
+          type: integer
+          description: ID único de la transacción generado por Payphone.
+          example: 123456789
+
+    LinkRequest:
+      type: object
+      required:
+        - amount
+        - amountWithTax
+        - amountWithoutTax
+        - tax
+        - reference
+        - clientTransactionId
+      properties:
+        amount:
+          type: integer
+          description: Monto total en centavos.
+        amountWithTax:
+          type: integer
+          description: Monto base con impuestos en centavos.
+        amountWithoutTax:
+          type: integer
+          description: Monto base sin impuestos en centavos.
+        tax:
+          type: integer
+          description: Monto del impuesto en centavos.
+        reference:
+          type: string
+          description: Descripción del cobro.
+        clientTransactionId:
+          type: string
+          description: ID único de la transacción en tu sistema.
+        expireIn:
+          type: integer
+          description: Tiempo de expiración del link en minutos. Si no se envía, usa el valor por defecto configurado en Payphone.
+          example: 1440
+        notifyUrl:
+          type: string
+          format: uri
+          description: URL del webhook para notificaciones asíncronas de pago.
+        storeId:
+          type: string
+          format: uuid
+          description: ID de la sucursal/tienda (Requerido para tokens multitienda).
+        terminalId:
+          type: string
+          description: ID de la terminal o caja.
+        documentId:
+          type: string
+          description: Documento de identidad del cliente.
+        email:
+          type: string
+          format: email
+          description: Correo del cliente.
+
+    LinkResponse:
+      type: object
+      properties:
+        url:
+          type: string
+          format: uri
+          description: URL corta de pago generada para compartir con el cliente.
+          example: "https://payp.hn/x/ejemplo123"
+
+    TransactionStatusResponse:
+      type: object
+      properties:
+        transactionId:
+          type: integer
+          description: ID de la transacción en Payphone.
+        clientTransactionId:
+          type: string
+          description: ID de la transacción en tu sistema.
+        transactionStatus:
+          type: string
+          enum: [Approved, Canceled, Pending, Rejected]
+          description: Estado actual del cobro.
+        amount:
+          type: integer
+          description: Monto total cobrado en centavos.
+        currency:
+          type: string
+          description: Moneda de la transacción (ej. USD).
+        authorizationCode:
+          type: string
+          description: Código de autorización bancaria si fue aprobada.
+        message:
+          type: string
+          description: Mensaje descriptivo del estado.
+        date:
+          type: string
+          format: date-time
+          description: Fecha y hora de la transacción.
+        documentId:
+          type: string
+          description: Documento de identidad usado para el pago.
+        phoneNumber:
+          type: string
+          description: Número de teléfono del usuario que pagó.
+        email:
+          type: string
+          description: Correo electrónico del usuario que pagó.
+        storeId:
+          type: string
+          format: uuid
+        terminalId:
+          type: string
+        bin:
+          type: string
+          description: Primeros 6 dígitos de la tarjeta (si fue aprobada).
+        lastDigits:
+          type: string
+          description: Últimos 4 dígitos de la tarjeta (si fue aprobada).
+        cardType:
+          type: string
+          description: Tipo de tarjeta (ej. Credit, Debit).
+        cardBrand:
+          type: string
+          description: Marca de la tarjeta (ej. Visa, Mastercard).
+
+    ReverseRequest:
+      type: object
+      required:
+        - transactionId
+      properties:
+        transactionId:
+          type: integer
+          description: ID de la transacción a reversar.
+
+    ReverseResponse:
+      type: object
+      properties:
+        status:
+          type: string
+          example: "Success"
+        message:
+          type: string
+          example: "Transacción reversada exitosamente"
