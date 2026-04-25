@@ -19,6 +19,8 @@ OpenAPI reference: docs/openapiv3.yaml
 import os
 import json
 import logging
+from decimal import ROUND_HALF_UP, Decimal
+from enum import Enum
 from typing import Optional
 
 import httpx
@@ -40,6 +42,83 @@ logger = logging.getLogger("payphone-mcp")
 load_dotenv()
 
 
+# ---------------------------------------------------------------------------
+# Motor fiscal determinista — IVA Ecuador (Payphone)
+# ---------------------------------------------------------------------------
+# El LLM NUNCA calcula impuestos. Solo pasa `monto` + `tipo_monto`.
+# Este módulo convierte todo a centavos enteros, como exige la API de Payphone.
+# ---------------------------------------------------------------------------
+
+class TipoMonto(str, Enum):
+    """Indica si el monto dado por el usuario incluye IVA o es la base imponible."""
+    SUBTOTAL      = "subtotal"       # el usuario dio la base SIN IVA  (default)
+    TOTAL_CON_IVA = "total_con_iva"  # el usuario dio el total CON IVA incluido
+
+
+_TWO = Decimal("0.01")
+
+
+def _iva_rate() -> Decimal:
+    """Lee IVA_EC_PERCENTAGE del entorno. Fallback: 0.15 (15%)."""
+    raw = os.environ.get("IVA_EC_PERCENTAGE", "0.15")
+    try:
+        rate = Decimal(raw)
+        if not (Decimal(0) < rate <= Decimal(1)):
+            raise ValueError()
+        return rate
+    except Exception:
+        raise ValueError(
+            f"IVA_EC_PERCENTAGE inválido: {raw!r}. "
+            "Debe ser un decimal entre 0 y 1, ej. '0.15' para 15%."
+        )
+
+
+def _r2(v: Decimal) -> Decimal:
+    """Redondeo estricto a 2 decimales (ROUND_HALF_UP)."""
+    return v.quantize(_TWO, rounding=ROUND_HALF_UP)
+
+
+def _calcular_centavos(monto: float, tipo: TipoMonto) -> tuple[int, int, int]:
+    """Calcula (total_cents, subtotal_cents, iva_cents) como enteros.
+
+    Payphone exige TODOS los valores monetarios como enteros en centavos.
+    Este método garantiza la invariante de la API:
+        total_cents == subtotal_cents + iva_cents
+
+    Args:
+        monto: El valor exacto dado por el usuario (en USD).
+        tipo:  TipoMonto.SUBTOTAL      → monto es la base sin IVA.
+               TipoMonto.TOTAL_CON_IVA → monto es el total ya con IVA.
+
+    Returns:
+        (total_cents, subtotal_cents, iva_cents)  — todos int.
+
+    Ejemplos:
+        _calcular_centavos(30.0, SUBTOTAL)      → (3450, 3000, 450)
+        _calcular_centavos(30.0, TOTAL_CON_IVA) → (3000, 2609, 391)
+    """
+    if monto <= 0:
+        raise ValueError(f"monto debe ser > 0. Recibido: {monto}")
+    rate = _iva_rate()
+    d = Decimal(str(monto))
+
+    if tipo == TipoMonto.TOTAL_CON_IVA:
+        total    = _r2(d)
+        subtotal = _r2(d / (1 + rate))
+        iva      = _r2(total - subtotal)
+    else:  # SUBTOTAL
+        subtotal = _r2(d)
+        iva      = _r2(d * rate)
+        total    = _r2(subtotal + iva)
+
+    def _to_cents(x: Decimal) -> int:
+        return int((x * 100).to_integral_value(rounding=ROUND_HALF_UP))
+
+    return _to_cents(total), _to_cents(subtotal), _to_cents(iva)
+
+
+# ---------------------------------------------------------------------------
+
 BASE_URL = "https://pay.payphonetodoesposible.com/api"
 HTTP_TIMEOUT = 30.0
 
@@ -52,12 +131,14 @@ mcp = FastMCP(
     instructions=(
         "MCP server for Payphone payment gateway (Ecuador). "
         "Credentials are loaded from PAYPHONE_TOKEN / PAYPHONE_STORE_ID env vars. "
-        "Provides tools to create direct charges, payment links, check status, and reverse charges. "
         "Provides tools to create direct charges (push notification to Payphone app), "
         "generate shareable payment links, check transaction status, and reverse charges. "
-        "CRITICAL — ALL monetary parameters (amount, amountWithTax, amountWithoutTax, tax) "
-        "must be integers representing CENTS. Example: $1.15 → amount=115. "
-        "The invariant amountWithTax + amountWithoutTax + tax == amount must ALWAYS hold."
+        "MONETARY INPUT RULES (agent must follow strictly): "
+        "  · Pass `monto` (float) with the EXACT number the user stated. "
+        "  · Pass `tipo_monto`='subtotal' if the user said the amount is WITHOUT VAT (default). "
+        "  · Pass `tipo_monto`='total_con_iva' if the user said the amount ALREADY INCLUDES VAT. "
+        "  · NEVER calculate subtotals, IVA, or cents yourself — the server does it deterministically. "
+        "The IVA rate is read from IVA_EC_PERCENTAGE env var (default 15%)."
     ))
 
 
@@ -162,11 +243,10 @@ async def create_payphone_sale(
     phoneNumber: str,
     countryCode: str,
     reference: str,
-    amount: int,
-    amountWithTax: int,
-    amountWithoutTax: int,
-    tax: int,
-    clientTransactionId: str,    storeId: str,
+    monto: float,
+    clientTransactionId: str,
+    tipo_monto: TipoMonto = TipoMonto.SUBTOTAL,
+    storeId: str | None = None,
     clientUserId: Optional[str] = None,
     responseUrl: Optional[str] = None,
     documentId: Optional[str] = None,
@@ -178,47 +258,31 @@ async def create_payphone_sale(
     A push notification will appear on their device to approve the payment.
     Returns the transactionId needed to check payment status later.
 
-    ⚠️ CRITICAL — ALL monetary parameters must be integers in CENTS.
-    Example: $1.15 → amount=115, amountWithTax=100, tax=15, amountWithoutTax=0.
-    The API strictly requires: amountWithTax + amountWithoutTax + tax == amount.
-    If this equation does not hold, the transaction will be REJECTED.
+    MONETARY INPUT (agent MUST follow this contract):
+      monto (float): The EXACT amount the user stated — pass it verbatim, no rounding.
+      tipo_monto (enum):
+        · "subtotal"      → monto is the taxable base WITHOUT IVA (default).
+        · "total_con_iva" → monto is the final price ALREADY INCLUDING IVA.
 
-    ⚠️ TAX CALCULATION — Always ask the user whether the amount includes VAT
-    before calling this tool. Never invent or approximate tax values.
+    ⚠️ DO NOT calculate subtotals, IVA amounts, or convert to cents yourself.
+       The server handles all deterministic arithmetic internally.
 
-    Use these EXACT formulas (Monto_User is in dollars):
-
-    CASE A: "Base $X WITHOUT VAT, add VAT Y% on top"
-      amount           = round((Monto_User * (1 + Y/100)) * 100)
-      amountWithTax    = round(Monto_User * 100)
-      amountWithoutTax = 0
-      tax              = amount - amountWithTax
-
-    CASE B: "Amount $X ALREADY INCLUDES VAT Y%"
-      amount           = round(Monto_User * 100)
-      amountWithTax    = round(amount / (1 + Y/100))
-      amountWithoutTax = 0
-      tax              = amount - amountWithTax
-
-    CASE C: "Amount $X with 0% VAT (no VAT applies)"
-      amount           = round(Monto_User * 100)
-      amountWithTax    = 0
-      amountWithoutTax = amount
-      tax              = 0
+    All monetary values (amount, amountWithTax, amountWithoutTax, tax) are computed
+    by the server from monto+tipo_monto and sent to the Payphone API as integers in
+    cents. The invariant amountWithTax + amountWithoutTax + tax == amount is enforced
+    by the server, never by the agent.
 
     REQUIRED PARAMETERS:
-      storeId (str): Store UUID associated with the token.
       phoneNumber (str): Customer phone number WITHOUT country code. Example: "0999999999"
       countryCode (str): Country calling code. Example: "593" for Ecuador.
       reference (str): Charge description visible to the customer. Example: "Invoice #001"
-      amount (int): ⚠️ TOTAL AMOUNT to charge in cents (amountWithTax + amountWithoutTax + tax). Example: 1150 for $11.50
-      amountWithTax (int): ⚠️ TAXABLE BASE (Base Imponible / Subtotal 15%) in cents. DO NOT confuse with Total Amount. Example: 1000
-      amountWithoutTax (int): ⚠️ ZERO-RATE BASE (Base Cero / Subtotal 0%) in cents. Example: 0
-      tax (int): ⚠️ TOTAL VAT AMOUNT (IVA) in cents. Example: 150
+      monto (float): Amount exactly as stated by the user. Example: 30.0
       clientTransactionId (str): Your unique transaction ID for reconciliation.
                                   Example: "ORD-2025-0042"
 
     OPTIONAL PARAMETERS:
+      tipo_monto (str, default="subtotal"): "subtotal" | "total_con_iva".
+      storeId (str): Store UUID (falls back to PAYPHONE_STORE_ID env var).
       clientUserId (str): Your internal customer identifier.
       responseUrl (str): Webhook URL for async payment status notifications.
       documentId (str): Customer cedula / RUC / passport.
@@ -229,24 +293,36 @@ async def create_payphone_sale(
       {"transactionId": int}  — Store this ID to poll status with get_transaction_status.
       Example: {"transactionId": 123456789}
 
-    EXAMPLE CALL:
-      create_payphone_sale(
-          token="eyJ...", storeId="b3a1...",
-          phoneNumber="0999999999", countryCode="593",
-          reference="Invoice #001", amount=1150, amountWithTax=1000,
-          amountWithoutTax=0, tax=150, clientTransactionId="ORD-2025-0042"
-      )
+    EXAMPLE CALLS:
+      # User says "charge $30 + VAT"
+      create_payphone_sale(phoneNumber="0999999999", countryCode="593",
+                           reference="Invoice #001", monto=30.0, tipo_monto="subtotal",
+                           clientTransactionId="ORD-2025-0042")
+
+      # User says "charge $34.50 VAT included"
+      create_payphone_sale(phoneNumber="0999999999", countryCode="593",
+                           reference="Invoice #001", monto=34.50, tipo_monto="total_con_iva",
+                           clientTransactionId="ORD-2025-0042")
     """
+    # ── Cálculo determinista (servidor, no el LLM) ──────────────────────────
+    amount_cents, amount_with_tax_cents, tax_cents = _calcular_centavos(monto, tipo_monto)
+    amount_without_tax_cents = 0  # base cero = 0 (flujo estándar gravado)
+
+    logger.info(
+        "[create_payphone_sale] monto=%.2f tipo=%s → total=%d amountWithTax=%d tax=%d",
+        monto, tipo_monto.value, amount_cents, amount_with_tax_cents, tax_cents,
+    )
+
     resolved_store = _resolve_store_id(storeId)
 
     payload: dict = {
-        "phoneNumber": phoneNumber,
-        "countryCode": countryCode,
-        "reference": reference,
-        "amount": amount,
-        "amountWithTax": amountWithTax,
-        "amountWithoutTax": amountWithoutTax,
-        "tax": tax,
+        "phoneNumber":        phoneNumber,
+        "countryCode":        countryCode,
+        "reference":          reference,
+        "amount":             amount_cents,
+        "amountWithTax":      amount_with_tax_cents,
+        "amountWithoutTax":   amount_without_tax_cents,
+        "tax":                tax_cents,
         "clientTransactionId": clientTransactionId,
     }
 
@@ -298,7 +374,7 @@ async def get_transaction_status(
        "cardBrand": str}       # "Visa" | "Mastercard" | ...
 
     EXAMPLE CALL:
-      get_transaction_status(transactionId=7891234, token="eyJ...")
+      get_transaction_status(transactionId=7891234)
     """
     return await _payphone_request("GET", f"/Sale/{transactionId}", )
 
@@ -306,12 +382,11 @@ async def get_transaction_status(
 
 @mcp.tool()
 async def create_payment_link(
-    amount: int,
-    amountWithTax: int,
-    amountWithoutTax: int,
-    tax: int,
+    monto: float,
     reference: str,
-    clientTransactionId: str,    storeId: str,
+    clientTransactionId: str,
+    tipo_monto: TipoMonto = TipoMonto.SUBTOTAL,
+    storeId: str | None = None,
     currency: str = "USD",
     expireIn: Optional[int] = None,
     notifyUrl: Optional[str] = None,
@@ -324,45 +399,25 @@ async def create_payment_link(
     Returns a short URL (e.g. https://payp.hn/x/...) to share via WhatsApp,
     email, or any channel. The customer pays through a browser.
 
-    ⚠️ CRITICAL — ALL monetary parameters must be integers in CENTS.
-    Example: $10.00 with no VAT → amount=1000, amountWithoutTax=1000,
-    amountWithTax=0, tax=0.
-    The API strictly requires: amountWithTax + amountWithoutTax + tax == amount.
+    MONETARY INPUT (agent MUST follow this contract):
+      monto (float): The EXACT amount the user stated — pass it verbatim, no rounding.
+      tipo_monto (enum):
+        · "subtotal"      → monto is the taxable base WITHOUT IVA (default).
+        · "total_con_iva" → monto is the final price ALREADY INCLUDING IVA.
 
-    ⚠️ TAX CALCULATION — Always ask the user whether the amount includes VAT
-    before calling this tool. Never invent or approximate tax values.
-
-    Use these EXACT formulas (Monto_User is in dollars):
-
-    CASE A: "Base $X WITHOUT VAT, add VAT Y% on top"
-      amount           = round((Monto_User * (1 + Y/100)) * 100)
-      amountWithTax    = round(Monto_User * 100)
-      amountWithoutTax = 0
-      tax              = amount - amountWithTax
-
-    CASE B: "Amount $X ALREADY INCLUDES VAT Y%"
-      amount           = round(Monto_User * 100)
-      amountWithTax    = round(amount / (1 + Y/100))
-      amountWithoutTax = 0
-      tax              = amount - amountWithTax
-
-    CASE C: "Amount $X with 0% VAT (no VAT applies)"
-      amount           = round(Monto_User * 100)
-      amountWithTax    = 0
-      amountWithoutTax = amount
-      tax              = 0
+    ⚠️ DO NOT calculate subtotals, IVA amounts, or convert to cents yourself.
+       The server computes all cent values and enforces the API invariant:
+       amountWithTax + amountWithoutTax + tax == amount.
 
     REQUIRED PARAMETERS:
-      storeId (str): Store UUID associated with the token.
-      amount (int): ⚠️ TOTAL AMOUNT in cents (amountWithTax + amountWithoutTax + tax). Example: 1150 for $11.50
-      amountWithTax (int): ⚠️ TAXABLE BASE (Base Imponible / Subtotal 15%) in cents. DO NOT confuse with Total Amount. Example: 1000
-      amountWithoutTax (int): ⚠️ ZERO-RATE BASE (Base Cero / Subtotal 0%) in cents. Example: 0
-      tax (int): ⚠️ TOTAL VAT AMOUNT (IVA) in cents. Example: 150
+      monto (float): Amount exactly as stated by the user. Example: 30.0
       reference (str): Charge description. Example: "Monthly subscription"
       clientTransactionId (str): Your unique transaction ID. Example: "LINK-2025-001"
 
     OPTIONAL PARAMETERS:
-      currency (str, default="USD"): Currency code. Required by the API.
+      tipo_monto (str, default="subtotal"): "subtotal" | "total_con_iva".
+      storeId (str): Store UUID (falls back to PAYPHONE_STORE_ID env var).
+      currency (str, default="USD"): Currency code.
       expireIn (int): Link expiration in minutes. Example: 1440 = 24 hours.
       notifyUrl (str): Webhook URL for async payment notifications.
       terminalId (str): POS terminal identifier.
@@ -374,23 +429,34 @@ async def create_payment_link(
       Example: {"url": "https://payp.hn/x/ejemplo123"}
       Share this URL via WhatsApp, email, or SMS. The customer pays in their browser.
 
-    EXAMPLE CALL:
-      create_payment_link(
-          token="eyJ...", storeId="b3a1...",
-          amount=1150, amountWithTax=1000, amountWithoutTax=0,
-          tax=150, reference="Invoice #001", clientTransactionId="LINK-001"
-      )
+    EXAMPLE CALLS:
+      # User says "generate a payment link for $30 + VAT"
+      create_payment_link(monto=30.0, tipo_monto="subtotal",
+                          reference="Invoice #001", clientTransactionId="LINK-001")
+
+      # User says "generate a payment link for $34.50 including VAT"
+      create_payment_link(monto=34.50, tipo_monto="total_con_iva",
+                          reference="Invoice #001", clientTransactionId="LINK-001")
     """
+    # ── Cálculo determinista (servidor, no el LLM) ──────────────────────────
+    amount_cents, amount_with_tax_cents, tax_cents = _calcular_centavos(monto, tipo_monto)
+    amount_without_tax_cents = 0  # base cero = 0
+
+    logger.info(
+        "[create_payment_link] monto=%.2f tipo=%s → total=%d amountWithTax=%d tax=%d",
+        monto, tipo_monto.value, amount_cents, amount_with_tax_cents, tax_cents,
+    )
+
     resolved_store = _resolve_store_id(storeId)
 
     payload: dict = {
-        "amount": amount,
-        "amountWithTax": amountWithTax,
-        "amountWithoutTax": amountWithoutTax,
-        "tax": tax,
-        "reference": reference,
+        "amount":             amount_cents,
+        "amountWithTax":     amount_with_tax_cents,
+        "amountWithoutTax":  amount_without_tax_cents,
+        "tax":               tax_cents,
+        "reference":         reference,
         "clientTransactionId": clientTransactionId,
-        "currency": currency,
+        "currency":          currency,
     }
 
     if expireIn is not None:
@@ -430,7 +496,7 @@ async def reverse_transaction(
       Example: {"status": "Success", "message": "Transacción reversada exitosamente"}
 
     EXAMPLE CALL:
-      reverse_transaction(transactionId=7891234, token="eyJ...")
+      reverse_transaction(transactionId=7891234)
     """
     resolved_token = _resolve_token()
     payload = {"transactionId": transactionId}
