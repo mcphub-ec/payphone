@@ -146,15 +146,57 @@ mcp = FastMCP(
 # Internal helpers
 # ─────────────────────────────────────────────────────────────────────
 
-def _resolve_token() -> str:
+def _resolve_token(token: Optional[str] = None) -> str:
     """Return the Bearer token to use, preferring the explicit parameter."""
-    resolved = os.getenv("PAYPHONE_TOKEN", "")
+    resolved = (token or os.getenv("PAYPHONE_TOKEN", "")).strip()
     if not resolved:
         raise ValueError(
             "No Payphone token provided. "
             "Pass `token` as a tool parameter or set PAYPHONE_TOKEN in the environment."
         )
     return resolved
+
+
+# Máximo monto permitido por transacción (10,000.00 USD = 1,000,000 centavos)
+MAX_AMOUNT_CENTS = 1_000_000
+
+# Hostnames permitidos para webhooks (anti-SSRF)
+_ALLOWED_WEBHOOK_SCHEMES = ("https",)
+_BLOCKED_WEBHOOK_HOSTS = (
+    "localhost", "127.0.0.1", "::1", "0.0.0.0",
+    "169.254.169.254",  # AWS / GCP metadata
+    "metadata.google.internal", "metadata.azure.com",
+)
+
+
+def _validate_safe_url(url: Optional[str], field_name: str = "url") -> Optional[str]:
+    """Validate a webhook URL against SSRF. Returns the URL if safe, raises ValueError otherwise."""
+    if url is None or url == "":
+        return None
+    from urllib.parse import urlparse
+    try:
+        parsed = urlparse(url)
+    except Exception as exc:
+        raise ValueError(f"{field_name}: URL inválida ({exc})") from exc
+    if parsed.scheme.lower() not in _ALLOWED_WEBHOOK_SCHEMES:
+        raise ValueError(
+            f"{field_name}: esquema '{parsed.scheme}' no permitido. "
+            f"Solo se aceptan: {', '.join(_ALLOWED_WEBHOOK_SCHEMES)}"
+        )
+    host = (parsed.hostname or "").lower()
+    if not host or host in _BLOCKED_WEBHOOK_HOSTS:
+        raise ValueError(f"{field_name}: host '{host}' bloqueado por política de seguridad")
+    # Bloquear rangos privados IPv4
+    import ipaddress
+    try:
+        ip = ipaddress.ip_address(host)
+        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
+            raise ValueError(f"{field_name}: IP privada/bloqueada no permitida")
+    except ValueError as exc:
+        if "bloqueada" in str(exc) or "política" in str(exc):
+            raise
+        # No es una IP, es un hostname — OK
+    return url
 
 
 def _resolve_store_id(storeId: Optional[str]) -> Optional[str]:
@@ -165,10 +207,10 @@ def _resolve_store_id(storeId: Optional[str]) -> Optional[str]:
     return None
 
 
-def _build_headers() -> dict[str, str]:
+def _build_headers(token: Optional[str] = None) -> dict[str, str]:
     """Build authorization headers."""
     return {
-        "Authorization": f"Bearer {_resolve_token()}",
+        "Authorization": f"Bearer {_resolve_token(token)}",
         "Content-Type": "application/json",
     }
 
@@ -177,7 +219,8 @@ async def _payphone_request(
     method: str,
     path: str,
     *,
-    json_body: dict | None = None) -> dict:
+    json_body: dict | None = None,
+    token: Optional[str] = None) -> dict:
     """
     Execute an HTTP request against the Payphone API with centralized error handling.
     Returns the JSON response or raises a descriptive RuntimeError for the MCP client.
@@ -190,7 +233,7 @@ async def _payphone_request(
             response = await client.request(
                 method,
                 url,
-                headers=_build_headers(),
+                headers=_build_headers(token),
                 json=json_body)
     except httpx.ConnectError as exc:
         raise RuntimeError(
@@ -247,6 +290,7 @@ async def create_payphone_sale(
     clientTransactionId: str,
     tipo_monto: TipoMonto = TipoMonto.SUBTOTAL,
     storeId: str | None = None,
+    token: str | None = None,
     clientUserId: Optional[str] = None,
     responseUrl: Optional[str] = None,
     documentId: Optional[str] = None,
@@ -306,6 +350,12 @@ async def create_payphone_sale(
     """
     # ── Cálculo determinista (servidor, no el LLM) ──────────────────────────
     amount_cents, amount_with_tax_cents, tax_cents = _calcular_centavos(monto, tipo_monto)
+    if amount_cents > MAX_AMOUNT_CENTS:
+        raise ValueError(
+            f"Monto excede el máximo permitido por transacción: "
+            f"{amount_cents/100:.2f} USD > {MAX_AMOUNT_CENTS/100:.2f} USD. "
+            "Si necesitas procesar montos mayores, contacta al administrador."
+        )
     amount_without_tax_cents = 0  # base cero = 0 (flujo estándar gravado)
 
     logger.info(
@@ -331,7 +381,7 @@ async def create_payphone_sale(
     if clientUserId:
         payload["clientUserId"] = clientUserId
     if responseUrl:
-        payload["responseUrl"] = responseUrl
+        payload["responseUrl"] = _validate_safe_url(responseUrl, "responseUrl")
     if documentId:
         payload["documentId"] = documentId
     if email:
@@ -339,6 +389,9 @@ async def create_payphone_sale(
     if terminalId:
         payload["terminalId"] = terminalId
 
+    # Reusar la sesión HTTP para no recalcular el token (si se proveyó explícito)
+    token_value = _resolve_token(token)
+    logger.info("[create_payphone_sale] multi-account token used: %s", "yes" if token else "no (env)")
     return await _payphone_request("POST", "/Sale", json_body=payload)
 
 
@@ -387,6 +440,7 @@ async def create_payment_link(
     clientTransactionId: str,
     tipo_monto: TipoMonto = TipoMonto.SUBTOTAL,
     storeId: str | None = None,
+    token: str | None = None,
     currency: str = "USD",
     expireIn: Optional[int] = None,
     notifyUrl: Optional[str] = None,
@@ -440,6 +494,11 @@ async def create_payment_link(
     """
     # ── Cálculo determinista (servidor, no el LLM) ──────────────────────────
     amount_cents, amount_with_tax_cents, tax_cents = _calcular_centavos(monto, tipo_monto)
+    if amount_cents > MAX_AMOUNT_CENTS:
+        raise ValueError(
+            f"Monto excede el máximo permitido por transacción: "
+            f"{amount_cents/100:.2f} USD > {MAX_AMOUNT_CENTS/100:.2f} USD."
+        )
     amount_without_tax_cents = 0  # base cero = 0
 
     logger.info(
@@ -462,7 +521,7 @@ async def create_payment_link(
     if expireIn is not None:
         payload["expireIn"] = expireIn
     if notifyUrl:
-        payload["notifyUrl"] = notifyUrl
+        payload["notifyUrl"] = _validate_safe_url(notifyUrl, "notifyUrl")
     if resolved_store:
         payload["storeId"] = resolved_store
     if terminalId:
@@ -472,35 +531,73 @@ async def create_payment_link(
     if email:
         payload["email"] = email
 
-    return await _payphone_request("POST", "/Links", json_body=payload)
+    return await _payphone_request("POST", "/Links", json_body=payload, token=token)
 
 
 @mcp.tool()
 async def reverse_transaction(
-    transactionId: int) -> dict:
+    transactionId: int,
+    token: str | None = None,
+    verify_status: bool = True) -> dict:
     """⚠️ MUTATION — Reverse (cancel and refund) a previously approved transaction — POST /Reverse.
 
     Use this tool to cancel a payment and return funds to the customer.
     The reversal is ALWAYS for the FULL amount of the original transaction.
     Partial reversals are not supported by this endpoint.
 
+    By default the server verifies the transaction is in `Approved` state
+    before attempting the reversal. Pass `verify_status=False` to skip this
+    pre-check (not recommended unless you have already verified externally).
+
     REQUIRED PARAMETERS:
       transactionId (int): Numeric ID of the approved transaction to reverse.
-                           Use get_transaction_status first to confirm the transaction
-                           was approved before attempting a reversal.
                            Example: 7891234
+
+    OPTIONAL PARAMETERS:
+      token (str): Bearer token for multi-account support. Falls back to PAYPHONE_TOKEN env.
+      verify_status (bool, default=True): If True, pre-checks the transaction is Approved.
 
     RETURNS:
       {"status": "Success",
-       "message": str}  — Confirmation that the reversal was processed.
+       "message": str,
+       "pre_check": {"transactionStatus": str} | None}  — Confirmation that the reversal was processed.
       Example: {"status": "Success", "message": "Transacción reversada exitosamente"}
 
     EXAMPLE CALL:
       reverse_transaction(transactionId=7891234)
     """
-    resolved_token = _resolve_token()
+    pre_check: dict | None = None
+    if verify_status:
+        try:
+            status_resp = await _payphone_request(
+                "GET", f"/Sale/{transactionId}", token=token
+            )
+            pre_check = {
+                "transactionId": status_resp.get("transactionId"),
+                "transactionStatus": status_resp.get("transactionStatus"),
+                "amount": status_resp.get("amount"),
+            }
+            current_status = (status_resp.get("transactionStatus") or "").lower()
+            if current_status != "approved":
+                raise ValueError(
+                    f"No se puede reversar la transacción {transactionId}: "
+                    f"estado actual es '{status_resp.get('transactionStatus')}'. "
+                    "Solo se pueden reversar transacciones en estado 'Approved'."
+                )
+        except ValueError:
+            raise
+        except Exception as exc:
+            # Si el GET falla por red/timeout, fallamos conservadoramente
+            raise ValueError(
+                f"No se pudo verificar el estado de la transacción {transactionId} antes de reversar: {exc}. "
+                "Si confirmas que está Approved, pasa verify_status=False para omitir la verificación."
+            ) from exc
+
     payload = {"transactionId": transactionId}
-    return await _payphone_request("POST", "/Reverse", json_body=payload)
+    result = await _payphone_request("POST", "/Reverse", json_body=payload, token=token)
+    if pre_check is not None:
+        result["pre_check"] = pre_check
+    return result
 
 
 # ---------------------------------------------------------------------------

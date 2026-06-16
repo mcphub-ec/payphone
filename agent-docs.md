@@ -3,7 +3,7 @@
 ## 1. Contexto General
 Servidor MCP para el gateway de pagos Payphone (Ecuador). Implementado con `fastmcp` + `streamable_http_app`.
 
-**Novedad v2.0 — Soporte multi-cuenta:** Cada herramienta acepta `apikey` y `storeId` como parámetros explícitos, permitiendo al agente alternar entre la cuenta personal y la cuenta de empresa en cualquier llamada, sin depender de variables de entorno fijas.
+**Novedad v2.0 — Soporte multi-cuenta:** Cada herramienta acepta `token` y `storeId` como parámetros explícitos, permitiendo al agente alternar entre la cuenta personal y la cuenta de empresa en cualquier llamada, sin depender de variables de entorno fijas.
 
 ## 2. Tecnologías Principales
 - **FastMCP**: Servidor base con transporte Streamable HTTP (`mcp.streamable_http_app()`).
@@ -14,12 +14,12 @@ Servidor MCP para el gateway de pagos Payphone (Ecuador). Implementado con `fast
 
 | Parámetro | Tipo | Requerido | Descripción |
 |-----------|------|-----------|-------------|
-| `apikey`  | str  | ✅ Sí | Bearer token de Payphone. Distintos por cuenta (personal / empresa). |
-| `storeId` | str  | ✅ Sí (Sale y Links) | UUID de la tienda asociada al `apikey`. |
+| `token`   | str  | ✅ Sí | Bearer token de Payphone. Distintos por cuenta (personal / empresa). |
+| `storeId` | str  | ✅ Sí (Sale y Links) | UUID de la tienda asociada al `token`. |
 
 **Regla para el agente:** Antes de llamar cualquier herramienta, confirma con el usuario qué cuenta usar e incluye las credenciales correspondientes en la llamada.
 
-Fallback: si `apikey` o `storeId` no se proveen (vacío/None), el servidor usa `PAYPHONE_TOKEN` / `PAYPHONE_STORE_ID` del entorno (compatible con despliegues de cuenta única).
+Fallback: si `token` o `storeId` no se proveen (vacío/None), el servidor usa `PAYPHONE_TOKEN` / `PAYPHONE_STORE_ID` del entorno (compatible con despliegues de cuenta única).
 
 ## 4. Reglas de Negocio Estrictas
 
