@@ -27,6 +27,9 @@ import httpx
 from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
 
+from mcp_common.security import validate_safe_url, validate_amount, MAX_AMOUNT_USD
+from mcp_common.logging_filter import install as install_logging_filter
+
 # ─────────────────────────────────────────────────────────────────────
 # Logging
 # ─────────────────────────────────────────────────────────────────────
@@ -35,6 +38,7 @@ logging.basicConfig(
     format='{"time":"%(asctime)s", "level":"%(levelname)s", "name":"%(name)s", "message":"%(message)s"}',
 )
 logger = logging.getLogger("payphone-mcp")
+install_logging_filter()
 
 # ─────────────────────────────────────────────────────────────────────
 # Configuration
@@ -157,46 +161,12 @@ def _resolve_token(token: Optional[str] = None) -> str:
     return resolved
 
 
-# Máximo monto permitido por transacción (10,000.00 USD = 1,000,000 centavos)
-MAX_AMOUNT_CENTS = 1_000_000
+# Máximo monto permitido por transacción (en centavos): re-exportado desde mcp_common
+MAX_AMOUNT_CENTS = int(MAX_AMOUNT_USD * 100)
 
-# Hostnames permitidos para webhooks (anti-SSRF)
-_ALLOWED_WEBHOOK_SCHEMES = ("https",)
-_BLOCKED_WEBHOOK_HOSTS = (
-    "localhost", "127.0.0.1", "::1", "0.0.0.0",
-    "169.254.169.254",  # AWS / GCP metadata
-    "metadata.google.internal", "metadata.azure.com",
-)
-
-
+# Re-exportar para compatibilidad con código que aún usa _validate_safe_url
 def _validate_safe_url(url: Optional[str], field_name: str = "url") -> Optional[str]:
-    """Validate a webhook URL against SSRF. Returns the URL if safe, raises ValueError otherwise."""
-    if url is None or url == "":
-        return None
-    from urllib.parse import urlparse
-    try:
-        parsed = urlparse(url)
-    except Exception as exc:
-        raise ValueError(f"{field_name}: URL inválida ({exc})") from exc
-    if parsed.scheme.lower() not in _ALLOWED_WEBHOOK_SCHEMES:
-        raise ValueError(
-            f"{field_name}: esquema '{parsed.scheme}' no permitido. "
-            f"Solo se aceptan: {', '.join(_ALLOWED_WEBHOOK_SCHEMES)}"
-        )
-    host = (parsed.hostname or "").lower()
-    if not host or host in _BLOCKED_WEBHOOK_HOSTS:
-        raise ValueError(f"{field_name}: host '{host}' bloqueado por política de seguridad")
-    # Bloquear rangos privados IPv4
-    import ipaddress
-    try:
-        ip = ipaddress.ip_address(host)
-        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
-            raise ValueError(f"{field_name}: IP privada/bloqueada no permitida")
-    except ValueError as exc:
-        if "bloqueada" in str(exc) or "política" in str(exc):
-            raise
-        # No es una IP, es un hostname — OK
-    return url
+    return validate_safe_url(url, field_name)
 
 
 def _resolve_store_id(storeId: Optional[str]) -> Optional[str]:
@@ -349,13 +319,8 @@ async def create_payphone_sale(
                            clientTransactionId="ORD-2025-0042")
     """
     # ── Cálculo determinista (servidor, no el LLM) ──────────────────────────
+    validate_amount(monto, "monto")  # raises if > MAX_AMOUNT_USD
     amount_cents, amount_with_tax_cents, tax_cents = _calcular_centavos(monto, tipo_monto)
-    if amount_cents > MAX_AMOUNT_CENTS:
-        raise ValueError(
-            f"Monto excede el máximo permitido por transacción: "
-            f"{amount_cents/100:.2f} USD > {MAX_AMOUNT_CENTS/100:.2f} USD. "
-            "Si necesitas procesar montos mayores, contacta al administrador."
-        )
     amount_without_tax_cents = 0  # base cero = 0 (flujo estándar gravado)
 
     logger.info(
@@ -493,12 +458,8 @@ async def create_payment_link(
                           reference="Invoice #001", clientTransactionId="LINK-001")
     """
     # ── Cálculo determinista (servidor, no el LLM) ──────────────────────────
+    validate_amount(monto, "monto")  # raises if > MAX_AMOUNT_USD
     amount_cents, amount_with_tax_cents, tax_cents = _calcular_centavos(monto, tipo_monto)
-    if amount_cents > MAX_AMOUNT_CENTS:
-        raise ValueError(
-            f"Monto excede el máximo permitido por transacción: "
-            f"{amount_cents/100:.2f} USD > {MAX_AMOUNT_CENTS/100:.2f} USD."
-        )
     amount_without_tax_cents = 0  # base cero = 0
 
     logger.info(
